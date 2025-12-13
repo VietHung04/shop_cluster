@@ -17,6 +17,9 @@ import seaborn as sns
 from scipy import stats
 from mlxtend.frequent_patterns import apriori, fpgrowth, association_rules
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA, TruncatedSVD
 import plotly.express as px
 import networkx as nx
 
@@ -1225,3 +1228,277 @@ class DataVisualizer:
         plt.axis("off")
         plt.tight_layout()
         plt.show()
+
+
+# =========================================================
+# 7. RULE-BASED CUSTOMER CLUSTERING (ASSOCIATION RULES -> KMEANS)
+# =========================================================
+class RuleBasedCustomerClusterer:
+    """Tạo đặc trưng (feature) từ LUẬT KẾT HỢP, sau đó phân cụm khách hàng.
+
+    Ý tưởng:
+    - Từ dữ liệu giao dịch đã làm sạch, tạo Customer × Item (boolean) = khách đã từng mua item đó hay chưa.
+    - Từ bảng luật kết hợp (rules_apriori_filtered.csv), chọn Top-K luật (theo lift/confidence/...)
+    - Với mỗi khách hàng và mỗi luật, tạo feature:
+        feature_j = 1 nếu khách đã mua *đủ* antecedents của luật j (tức antecedents ⊆ basket của khách)
+        (có thể nhân trọng số theo lift/confidence/support)
+    - (Tuỳ chọn) Ghép thêm RFM để phân cụm ổn định hơn.
+
+    Lưu ý: Đây là cách “dùng luật để tạo embedding thô” cho khách hàng.
+    """
+
+    def __init__(
+        self,
+        df_clean: pd.DataFrame,
+        customer_col: str = "CustomerID",
+        invoice_col: str = "InvoiceNo",
+        item_col: str = "Description",
+        quantity_col: str = "Quantity",
+        price_col: str = "UnitPrice",
+        date_col: str = "InvoiceDate",
+    ):
+        self.df = df_clean.copy()
+        self.customer_col = customer_col
+        self.invoice_col = invoice_col
+        self.item_col = item_col
+        self.quantity_col = quantity_col
+        self.price_col = price_col
+        self.date_col = date_col
+
+        # runtime artifacts
+        self.customer_item_bool: pd.DataFrame | None = None
+        self.customers_: list[str] | None = None
+        self.rules_df_: pd.DataFrame | None = None
+        self.X_: np.ndarray | None = None
+        self.model_: KMeans | None = None
+
+    @staticmethod
+    def _parse_items(items_str: str) -> list[str]:
+        if items_str is None:
+            return []
+        s = str(items_str).strip()
+        if not s:
+            return []
+        # format mặc định trong project: "A, B, C"
+        return [x.strip() for x in s.split(",") if x.strip()]
+
+    def build_customer_item_matrix(self, threshold: int = 1) -> pd.DataFrame:
+        """Tạo Customer × Item boolean (khách đã từng mua item hay chưa)."""
+        df = self.df.copy()
+
+        if self.customer_col not in df.columns:
+            raise ValueError(f"Thiếu cột {self.customer_col} trong df_clean.")
+        if self.item_col not in df.columns:
+            raise ValueError(f"Thiếu cột {self.item_col} trong df_clean.")
+        if self.quantity_col not in df.columns:
+            raise ValueError(f"Thiếu cột {self.quantity_col} trong df_clean.")
+
+        # Chuẩn hoá CustomerID thành string để tránh float ".0"
+        df[self.customer_col] = (
+            df[self.customer_col].astype(str).str.replace(".0", "", regex=False).str.zfill(6)
+        )
+
+        customer_item_qty = (
+            df.groupby([self.customer_col, self.item_col])[self.quantity_col]
+            .sum()
+            .unstack(fill_value=0)
+        )
+        customer_item_bool = (customer_item_qty >= threshold)
+        self.customer_item_bool = customer_item_bool
+        self.customers_ = customer_item_bool.index.astype(str).tolist()
+        return self.customer_item_bool
+
+    def load_rules(
+        self,
+        rules_csv_path: str,
+        top_k: int = 200,
+        sort_by: str = "lift",
+        min_support: float | None = None,
+        min_confidence: float | None = None,
+        min_lift: float | None = None,
+    ) -> pd.DataFrame:
+        """Đọc rules CSV và chọn Top-K luật để tạo feature."""
+        rules = pd.read_csv(rules_csv_path)
+
+        # kỳ vọng notebook Apriori đã add_readable_rule_str()
+        required_cols = {"antecedents_str", "consequents_str"}
+        if not required_cols.issubset(set(rules.columns)):
+            raise ValueError(
+                "rules_csv_path cần có cột antecedents_str và consequents_str. "
+                "Hãy đảm bảo notebook Apriori đã gọi add_readable_rule_str() và lưu lại."
+            )
+
+        # filter ngưỡng (nếu muốn “lọc lần 2”)
+        if (min_support is not None) and ("support" in rules.columns):
+            rules = rules[rules["support"] >= min_support]
+        if (min_confidence is not None) and ("confidence" in rules.columns):
+            rules = rules[rules["confidence"] >= min_confidence]
+        if (min_lift is not None) and ("lift" in rules.columns):
+            rules = rules[rules["lift"] >= min_lift]
+
+        if sort_by in rules.columns:
+            rules = rules.sort_values(sort_by, ascending=False)
+
+        if top_k is not None:
+            rules = rules.head(int(top_k))
+
+        rules = rules.reset_index(drop=True)
+        self.rules_df_ = rules
+        return rules
+
+    def build_rule_feature_matrix(
+        self,
+        weighting: str = "none",
+        min_antecedent_len: int = 1,
+    ) -> np.ndarray:
+        """Tạo ma trận đặc trưng Customer × Rule.
+
+        weighting:
+        - "none": feature 0/1
+        - "lift" / "confidence" / "support": nhân trọng số theo cột tương ứng (nếu có)
+        - "lift_x_conf": lift * confidence (nếu có)
+        """
+        if self.customer_item_bool is None:
+            self.build_customer_item_matrix()
+
+        if self.rules_df_ is None:
+            raise ValueError("Chưa load rules. Hãy gọi load_rules() trước.")
+
+        customer_item = self.customer_item_bool
+        rules = self.rules_df_.copy()
+
+        n_customers = customer_item.shape[0]
+        n_rules = rules.shape[0]
+        X = np.zeros((n_customers, n_rules), dtype=np.float32)
+
+        # map cột item -> idx để kiểm tra nhanh
+        item_cols = set(customer_item.columns.astype(str))
+
+        for j, row in rules.iterrows():
+            ants = self._parse_items(row.get("antecedents_str", ""))
+            if len(ants) < min_antecedent_len:
+                continue
+
+            # nếu antecedents có item không nằm trong customer_item matrix => bỏ luật (tránh KeyError)
+            if any(a not in item_cols for a in ants):
+                continue
+
+            # khách hàng nào mua đủ antecedents?
+            mask = customer_item[ants].all(axis=1).astype(np.float32).values
+
+            # trọng số
+            w = 1.0
+            if weighting == "lift" and "lift" in row:
+                w = float(row["lift"])
+            elif weighting == "confidence" and "confidence" in row:
+                w = float(row["confidence"])
+            elif weighting == "support" and "support" in row:
+                w = float(row["support"])
+            elif weighting == "lift_x_conf" and ("lift" in row) and ("confidence" in row):
+                w = float(row["lift"]) * float(row["confidence"])
+
+            X[:, j] = mask * w
+
+        self.X_ = X
+        return X
+
+    def compute_rfm(self, snapshot_date=None) -> pd.DataFrame:
+        """Tính RFM trực tiếp từ df_clean (tương tự DataCleaner.compute_rfm)."""
+        df = self.df.copy()
+        if "TotalPrice" not in df.columns:
+            df["TotalPrice"] = df[self.quantity_col] * df[self.price_col]
+
+        df[self.customer_col] = (
+            df[self.customer_col].astype(str).str.replace(".0", "", regex=False).str.zfill(6)
+        )
+
+        if snapshot_date is None:
+            snapshot_date = pd.to_datetime(df[self.date_col]).max() + pd.Timedelta(days=1)
+        else:
+            snapshot_date = pd.to_datetime(snapshot_date)
+
+        rfm = df.groupby(self.customer_col).agg(
+            Recency=(self.date_col, lambda x: (snapshot_date - pd.to_datetime(x).max()).days),
+            Frequency=(self.invoice_col, "nunique"),
+            Monetary=("TotalPrice", "sum"),
+        )
+        return rfm.reset_index()
+
+    def build_final_features(
+        self,
+        weighting: str = "none",
+        use_rfm: bool = True,
+        rfm_scale: bool = True,
+        rule_scale: bool = False,
+        min_antecedent_len: int = 1,
+    ) -> tuple[np.ndarray, pd.DataFrame]:
+        """Trả về (X, meta_df) với meta_df gồm CustomerID và (tuỳ chọn) RFM."""
+        if self.customer_item_bool is None:
+            self.build_customer_item_matrix()
+
+        # Rule features
+        X_rules = self.build_rule_feature_matrix(
+            weighting=weighting,
+            min_antecedent_len=min_antecedent_len,
+        )
+
+        meta = pd.DataFrame({self.customer_col: self.customers_})
+
+        if not use_rfm:
+            self.X_ = X_rules
+            return X_rules, meta
+
+        rfm = self.compute_rfm()
+        meta = meta.merge(rfm, on=self.customer_col, how="left")
+
+        X = X_rules
+        # scale RFM (khuyên dùng)
+        rfm_cols = ["Recency", "Frequency", "Monetary"]
+        rfm_values = meta[rfm_cols].fillna(0).values.astype(np.float32)
+
+        if rfm_scale:
+            rfm_values = StandardScaler().fit_transform(rfm_values)
+
+        if rule_scale:
+            X = StandardScaler().fit_transform(X_rules)
+
+        X_final = np.hstack([X, rfm_values]).astype(np.float32)
+        self.X_ = X_final
+        return X_final, meta
+
+    @staticmethod
+    def choose_k_by_silhouette(
+        X: np.ndarray,
+        k_min: int = 2,
+        k_max: int = 10,
+        random_state: int = 42,
+    ) -> pd.DataFrame:
+        """Chọn k dựa trên silhouette score."""
+        rows = []
+        for k in range(int(k_min), int(k_max) + 1):
+            km = KMeans(n_clusters=k, n_init="auto", random_state=random_state)
+            labels = km.fit_predict(X)
+            score = silhouette_score(X, labels)
+            rows.append({"k": k, "silhouette": score})
+        return pd.DataFrame(rows).sort_values("silhouette", ascending=False).reset_index(drop=True)
+
+    def fit_kmeans(
+        self,
+        X: np.ndarray,
+        n_clusters: int,
+        random_state: int = 42,
+    ) -> np.ndarray:
+        """Fit KMeans và trả về labels."""
+        self.model_ = KMeans(n_clusters=int(n_clusters), n_init="auto", random_state=random_state)
+        labels = self.model_.fit_predict(X)
+        return labels
+
+    @staticmethod
+    def project_2d(X: np.ndarray, method: str = "pca", random_state: int = 42) -> np.ndarray:
+        """Giảm chiều xuống 2D để vẽ."""
+        method = method.lower()
+        if method == "pca":
+            return PCA(n_components=2, random_state=random_state).fit_transform(X)
+        if method in ("svd", "truncatedsvd"):
+            return TruncatedSVD(n_components=2, random_state=random_state).fit_transform(X)
+        raise ValueError("method phải là 'pca' hoặc 'svd'.")
