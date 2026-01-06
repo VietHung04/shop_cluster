@@ -1,11 +1,11 @@
 # README – Phân khúc khách hàng dựa trên Luật kết hợp & RFM
 ## 👥 Thông tin Nhóm
 
-- **Nhóm:** Nhóm 5
+- **Nhóm:** Nhóm 4
 - **Thành viên:**
-  - Nguyễn Nam Cường
-  - Nguyễn Văn Đạt
-  - Trần Trường Giang
+  - Phan Việt Hùng
+  - Nguyễn Mạnh Đông
+  - Trần Minh Thành
 ## 🎯 Mục tiêu
 
 Mini Project này nhằm xây dựng một **pipeline phân khúc khách hàng hoàn chỉnh** theo hướng:
@@ -215,54 +215,7 @@ Nhóm khảo sát K từ **2 → 10** bằng **Silhouette score** trên **biến
 * Chăm sóc riêng, ưu đãi độc quyền
 
 ---
-## 7.Dashboard Streamlit
 
-<img width="1919" height="909" alt="image" src="https://github.com/user-attachments/assets/68dd576b-1a5e-4c9e-aec0-bdca64ec09da" />
-
-
-## Project Structure
-```text
-SHOP_CLUSTER/
-├── data/
-│   ├── raw/
-│   │   └── online_retail.csv
-│   └── processed/
-│       ├── basket_bool.parquet
-│       ├── cleaned_uk_data.csv
-│       ├── customer_clusters_from_rules.csv
-│       ├── rules_apriori_filtered.csv
-│       └── rules_fpgrowth_filtered.csv
-│
-├── notebooks/
-│   ├── preprocessing_and_eda.ipynb
-│   ├── basket_preparation.ipynb
-│   ├── apriori_modelling.ipynb
-│   ├── fp_growth_modelling.ipynb
-│   ├── compare_apriori_fpgrowth.ipynb
-│   ├── clustering_from_rules.ipynb
-│   └── runs/
-│       ├── preprocessing_and_eda_run.ipynb
-│       ├── basket_preparation_run.ipynb
-│       ├── apriori_modelling_run.ipynb
-│       ├── fp_growth_modelling_run.ipynb
-│       ├── compare_apriori_fpgrowth_run.ipynb
-│       ├── clustering_from_rules_run.ipynb
-│       └── visualize_rules.py
-│
-├── src/
-│   ├── cluster_library.py
-│   └── __pycache__/
-│       ├── apriori_library.cpython-311.pyc
-│       ├── apriori_library.cpython-312.pyc
-│       ├── cluster_library.cpython-310.pyc
-│       └── cluster_library.cpython-311.pyc
-│── Dashboard.py
-├── run_papermill.py
-├── requirements.txt
-├── README.md
-├── LICENSE.txt
-└── gitignore.txt
-```
 
 ## Tech Stack
 
